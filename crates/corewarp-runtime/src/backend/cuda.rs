@@ -884,7 +884,12 @@ impl Backend for CudaBackend {
         Ok(out)
     }
 
-    /// Synchronous D2H on stream 0 when `device_dirty`; copies pinned slice into host memory.
+    /// Synchronous D2H when `device_dirty`; copies pinned slice into host memory.
+    ///
+    /// Critical: never issue D2H on stream 0 while other slots may still be busy on
+    /// that same stream (or while peer streams still write the resident). We first
+    /// synchronize every in-flight slot's `done` event so the device copy is stable,
+    /// then perform D2H on stream 0.
     fn prepare_download(
         &mut self,
         id: BufferId,
@@ -900,7 +905,13 @@ impl Backend for CudaBackend {
             return Err(Error::Backend("download: device missing".into()));
         }
 
-        // Stream 0 performs synchronous download D2H.
+        // Drain GPU work on all slots before touching the resident with D2H.
+        for slot in &self.slots {
+            if let Some(ev) = slot.done.as_ref() {
+                ev.synchronize().map_err(cu_err)?;
+            }
+        }
+
         let stream = self.slots[0].stream.clone();
         self.ensure_pinned(0, len)?;
 
