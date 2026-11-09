@@ -1,4 +1,9 @@
-//! Experimento 2: alocação por job (manual) vs pool residente CoreWarp.
+//! Experiment 2: alloc-per-job CUDA baseline vs CoreWarp resident device pool.
+//!
+//! Contrasts a path that allocates/frees device memory every job against the
+//! runtime's pooled resident buffers. Requires `--features cuda`.
+//! Run with: `cargo run -p corewarp --release --example bench_pool --features cuda`
+
 use std::time::Instant;
 
 use corewarp::{BackendKind, CoreWarp, Operation, SchedulingPolicy};
@@ -12,6 +17,7 @@ extern "C" __global__ void saxpy(float a, const float* x, float* y, size_t n) {
 }
 "#;
 
+/// Manual path: fresh device alloc + H2D for x and y on every job (drops free on scope exit).
 fn alloc_per_job(n: usize, jobs: usize) -> Result<(f64, u64), String> {
     let ctx = CudaContext::new(0).map_err(|e| format!("{e:?}"))?;
     let stream = ctx.default_stream();
@@ -46,12 +52,13 @@ fn alloc_per_job(n: usize, jobs: usize) -> Result<(f64, u64), String> {
         }
         .map_err(|e| format!("{e:?}"))?;
         let _ = stream.clone_dtoh(&d_y).map_err(|e| format!("{e:?}"))?;
-        // d_x/d_y drop → free
+        // d_x / d_y drop → device free
     }
     stream.synchronize().map_err(|e| format!("{e:?}"))?;
     Ok((t0.elapsed().as_secs_f64(), allocs))
 }
 
+/// Runtime path: pre-upload a ring of y buffers and reuse residents across rounds.
 fn runtime_pool(n: usize, jobs: usize) -> corewarp::Result<(f64, u64, u64)> {
     let mut rt = CoreWarp::builder()
         .backend(BackendKind::Cuda)
@@ -63,7 +70,7 @@ fn runtime_pool(n: usize, jobs: usize) -> corewarp::Result<(f64, u64, u64)> {
         .build()?;
 
     let x = rt.upload(&vec![1.0; n])?;
-    // Pré-aloca ys uma vez; reutiliza buffers residentes entre submits em rodadas.
+    // Pre-allocate ys once; reuse resident device buffers across submit rounds.
     let ys: Vec<_> = (0..jobs.min(32))
         .map(|_| rt.upload(&vec![2.0; n]))
         .collect::<Result<Vec<_>, _>>()?;

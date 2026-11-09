@@ -1,42 +1,42 @@
-# Spec de implementação — CoreWarp 0.1.0
+# Implementation spec — CoreWarp 0.1.0
 
-## O que preservar do repo atual
+## What to preserve from the current repo
 
-| Componente | Destino |
-|------------|---------|
+| Component | Destination |
+|-----------|-------------|
 | `CoreWarp` + scheduler + aging | `corewarp-runtime` |
 | `MemoryManager` + dirty flags | `corewarp-memory` |
-| Host backend + contratos | `corewarp-runtime::backend::host` |
-| CUDA residentes / pinned / events | `corewarp-runtime::backend::cuda` |
-| Ops Saxpy/VAdd/VScale/Reduction | `corewarp-kernels` (+ registry runtime) |
-| Testes de contrato host | `corewarp-runtime` tests |
-| Benches | `examples/` + futuro `benches/` |
+| Host backend + contracts | `corewarp-runtime::backend::host` |
+| CUDA residents / pinned / events | `corewarp-runtime::backend::cuda` |
+| Saxpy/VAdd/VScale/Reduction ops | `corewarp-kernels` (+ runtime registry) |
+| Host contract tests | `corewarp-runtime` tests |
+| Benches | `examples/` + future `benches/` |
 
-## Workspace 0.1 (crates físicas)
+## 0.1 workspace (physical crates)
 
 ```text
-crates/corewarp-core        tipos, erros (sem cudarc)
+crates/corewarp-core        types, errors (no cudarc)
 crates/corewarp-telemetry   JobMetrics / RuntimeMetrics
 crates/corewarp-memory      MemoryManager
 crates/corewarp-runtime     Device, Buffer, Submission, CoreWarp, backends
-crates/corewarp-kernels     ops compartilhadas (API alta)
+crates/corewarp-kernels     shared ops (high-level API)
 crates/corewarp-ai          normalize (+ stubs)
 crates/corewarp-game        particle_update (+ stubs)
 crates/corewarp             facade + prelude
 ```
 
-> `corewarp-cuda` / `corewarp-host` como crates separados ficam para 0.2; em 0.1 são módulos isolados dentro de `runtime` (único ponto que pode usar `cudarc`).
+> Separate `corewarp-cuda` / `corewarp-host` crates are planned for 0.2; in 0.1 they are isolated modules inside `runtime` (the only place that may use `cudarc`).
 
-## Contratos públicos
+## Public contracts
 
 ### Device
 - `Device::host()` / `Device::cuda(index)`
 - `upload`, `allocate`, `submit`, `poll`, `drain`, `shutdown`
-- Não esconde streams/prioridade: `DeviceConfig { streams, max_in_flight, … }`
+- Does not hide streams/priority: `DeviceConfig { streams, max_in_flight, … }`
 
 ### Buffer
-- Handle tipado `Buffer` (wrap `BufferId` + `Device` fraco / id)
-- `download` só quando não in-flight; D2H sob demanda se `device_dirty`
+- Typed handle `Buffer` (wraps `BufferId` + weak `Device` / id)
+- `download` only when not in-flight; on-demand D2H if `device_dirty`
 
 ### Submission
 - `poll() -> Pending | Completed | Failed`
@@ -44,7 +44,7 @@ crates/corewarp             facade + prelude
 - `metrics()`
 
 ### Operation
-- Continua enum no core; kernels/ai/game constroem `Operation` ou submits tipados
+- Remains an enum in core; kernels/ai/game build `Operation` or typed submits
 
 ## Features
 
@@ -57,23 +57,23 @@ game = ["dep:corewarp-game"]
 full = ["cuda", "ai", "game"]
 ```
 
-## Ops 0.1 (meta da proposta = 6)
+## 0.1 ops (proposal target = 6)
 
-| Op | Crate | Status alvo 0.1 |
-|----|-------|-----------------|
-| Reduction | kernels | já existe |
-| VectorScale | kernels | já existe |
-| Normalize | ai | novo (host+cuda) |
-| ParticleUpdate | game | novo (host+cuda simples) |
-| PrefixSum | kernels | feito (host + CUDA scan em blocos, n≤65536) |
-| Histogram | kernels | feito (host + CUDA atomics) |
+| Op | Crate | 0.1 target status |
+|----|-------|-------------------|
+| Reduction | kernels | already exists |
+| VectorScale | kernels | already exists |
+| Normalize | ai | new (host+cuda) |
+| ParticleUpdate | game | new (simple host+cuda) |
+| PrefixSum | kernels | done (host + CUDA block scan, n≤65536) |
+| Histogram | kernels | done (host + CUDA atomics) |
 
-Ordem de entrega alinhada às semanas: foundation → CUDA polish → ops → benches.
+Delivery order aligned with weeks: foundation → CUDA polish → ops → benches.
 
-## Critérios de aceite 0.1
+## 0.1 acceptance criteria
 
-- Workspace compila com `--features host` e `--features cuda`
-- Testes host de contrato 100%
-- Device API estável o bastante para examples
-- 3 examples: image/tensor/particle (mínimos)
-- Benches host + cuda (quando GPU disponível)
+- Workspace builds with `--features host` and `--features cuda`
+- Host contract tests 100% pass
+- Device API stable enough for examples
+- 3 examples: image/tensor/particle (minimal)
+- Host + CUDA benches (when GPU is available)

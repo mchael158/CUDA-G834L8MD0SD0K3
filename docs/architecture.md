@@ -1,31 +1,31 @@
-# Arquitetura
+# Architecture
 
 ```text
 submit(Operation) → scheduler → stream slot
         ↓
- ensure resident (H2D pinned só se host_dirty)
+ ensure resident (H2D pinned only if host_dirty)
         ↓
- kernel (device buffers permanentes)
+ kernel (permanent device buffers)
         ↓
  CudaEvent done  →  poll try_is_complete
         ↓
- mark device_dirty; download faz D2H sob demanda
+ mark device_dirty; download performs on-demand D2H
 ```
 
-## Componentes
+## Components
 
-| Módulo | Papel |
-|--------|-------|
+| Module | Role |
+|--------|------|
 | `core` | `CoreWarp`, `Operation`, handles |
-| `scheduler` | fila, aging, Fixed/Adaptive |
-| `memory` | pool host + `host_dirty`/`device_dirty` |
-| `telemetry` | métricas; estágios CUDA via events |
-| `backend::host` | contratos (não emula GPU) |
-| `backend::cuda` | residentes, pinned, events, NVRTC |
+| `scheduler` | queue, aging, Fixed/Adaptive |
+| `memory` | host pool + `host_dirty`/`device_dirty` |
+| `telemetry` | metrics; CUDA stages via events |
+| `backend::host` | contracts (does not emulate GPU) |
+| `backend::cuda` | residents, pinned, events, NVRTC |
 
-## Regras
+## Rules
 
-- Conclusão CUDA só via `try_is_complete`.
-- Timing de estágio: `CudaEvent` com `CU_EVENT_DEFAULT`.
-- H2D usa pinned staging; D2H só em `download` (ou parciais de reduction).
-- Buffer `in_flight > 0` bloqueia `download`/`free`.
+- CUDA completion only via `try_is_complete`.
+- Stage timing: `CudaEvent` with `CU_EVENT_DEFAULT`.
+- H2D uses pinned staging; D2H only in `download` (or partial reduction paths).
+- Buffer with `in_flight > 0` blocks `download`/`free`.

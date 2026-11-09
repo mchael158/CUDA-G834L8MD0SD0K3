@@ -1,64 +1,64 @@
-# CoreWarp — especificação de engenharia
+# CoreWarp — engineering specification
 
-## Auditoria do repositório atual (pré-pivot)
+## Audit of the current repository (pre-pivot)
 
-| Área | Estado | Decisão |
-|------|--------|---------|
-| Fila por prioridade + `tick`/`drain` | Útil | Preservar lógica; renomear para scheduler |
-| Multi-stream slots | Útil | Preservar |
-| Backend host | Útil | Manter como validador de contrato (sem fingir tempos GPU) |
-| Feature `cuda` + cudarc/NVRTC | Útil | Isolar em `backend::cuda` |
-| SAXPY como único job | Fraco | Expandir para 4 ops |
-| `Job` com `Vec` embutido | Substituir | `BufferId` + memory manager |
-| Retire CUDA por piso de ms + `synchronize` | Substituir | `CudaEvent::try_is_complete` |
-| API `Pipeline` / `Job::saxpy` | Quebrar | API `CoreWarp` + `Operation` |
-| Analogias CPU / Byteflow | Já removidas | Manter fora |
+| Area | State | Decision |
+|------|-------|----------|
+| Priority queue + `tick`/`drain` | Useful | Preserve logic; rename to scheduler |
+| Multi-stream slots | Useful | Preserve |
+| Host backend | Useful | Keep as contract validator (no fake GPU timing) |
+| Feature `cuda` + cudarc/NVRTC | Useful | Isolate in `backend::cuda` |
+| SAXPY as the only job | Weak | Expand to 4 ops |
+| `Job` with embedded `Vec` | Replace | `BufferId` + memory manager |
+| CUDA retire by ms floor + `synchronize` | Replace | `CudaEvent::try_is_complete` |
+| `Pipeline` / `Job::saxpy` API | Break | `CoreWarp` + `Operation` API |
+| CPU / Byteflow analogies | Already removed | Keep out |
 
-## Tese
+## Thesis
 
-Runtime Rust leve para workloads CUDA dinâmicos: buffers reutilizáveis, conclusão assíncrona por evento, despacho mensurável. Não compete com Graphs/TensorRT; reduz o boilerplate de muitos jobs independentes.
+Lightweight Rust runtime for dynamic CUDA workloads: reusable buffers, event-based async completion, measurable dispatch. Does not compete with Graphs/TensorRT; reduces boilerplate for many independent jobs.
 
-## Módulos (crate único; crates publicados depois)
+## Modules (single crate; published crates later)
 
 ```
-core        API, Operation, handles, estados
-scheduler   prioridade, aging, admission, Fixed|Adaptive
-memory      pool por size-class, lifetime até completion event
-telemetry   métricas por estágio e agregadas
-backend     trait + host + cuda (cudarc só aqui)
+core        API, Operation, handles, states
+scheduler   priority, aging, admission, Fixed|Adaptive
+memory      pool by size-class, lifetime until completion event
+telemetry   per-stage and aggregate metrics
+backend     trait + host + cuda (cudarc only here)
 ```
 
-## Máquina de estados do job
+## Job state machine
 
 `Queued → Submitted → Running → Completed | Failed`
 
-Transições:
+Transitions:
 - `submit` → Queued
-- emissão em stream livre → Submitted → Running (após enqueue CUDA)
-- `event.try_is_complete() == true` → Completed (ou Failed se query retornar erro async)
+- dispatch on a free stream → Submitted → Running (after CUDA enqueue)
+- `event.try_is_complete() == true` → Completed (or Failed if async query returns error)
 
-## Ownership de buffers
+## Buffer ownership
 
-- `upload` cria `BufferId` com dados host (+ device lazy no CUDA).
-- Ops incrementam `in_flight` nos buffers referenciados.
-- Completion decrementa; só então o bloco do pool pode ser reutilizado.
-- `download` exige job produtor concluído / buffer sem writers em voo.
+- `upload` creates `BufferId` with host data (+ lazy device on CUDA).
+- Ops increment `in_flight` on referenced buffers.
+- Completion decrements; only then can the pool block be reused.
+- `download` requires the producing job completed / buffer with no in-flight writers.
 
 ## CUDA completion
 
 ```
 H2D → kernel → D2H (staging) → record CudaEvent
-poll: event.try_is_complete() → writeback host → liberar pool → Completed
+poll: event.try_is_complete() → writeback host → release pool → Completed
 ```
 
-Proibido: piso de milissegundos como critério de retire.
+Forbidden: millisecond floor as retire criterion.
 
-## MVP (ordem)
+## MVP (order)
 
-1. Events + lifecycle + API nova (Semana 1)
-2. Memory pool + 4 ops (Semana 2)
-3. Telemetria por estágio + Adaptive experimental + benches (Semana 3)
+1. Events + lifecycle + new API (Week 1)
+2. Memory pool + 4 ops (Week 2)
+3. Per-stage telemetry + experimental Adaptive + benches (Week 3)
 
-## Fora de escopo
+## Out of scope
 
-Multi-GPU, multi-processo, work-stealing, fused kernels, Graphs próprios, linguagem de kernels, runtime de IA, OpenCL/Vulkan, GUI.
+Multi-GPU, multi-process, work-stealing, fused kernels, custom Graphs, kernel language, AI runtime, OpenCL/Vulkan, GUI.

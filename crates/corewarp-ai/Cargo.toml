@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Primitivas GPU para pré-processamento de IA"
+description = "AI preprocessing primitives (normalize, …) on CoreWarp"
 
 [dependencies]
 corewarp-core = { workspace = true }

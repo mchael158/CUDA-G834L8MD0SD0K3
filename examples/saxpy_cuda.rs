@@ -1,3 +1,11 @@
+//! CUDA SAXPY smoke test: large vector, resident reuse, event-based job metrics.
+//!
+//! Requires `--features cuda` and a working CUDA Toolkit/driver.
+//! Run with: `cargo run -p corewarp --release --example saxpy_cuda --features cuda`
+//!
+//! Expected numeric result after two submits on the same `y`:
+//! 1st: y = 3*1 + 2 = 5; 2nd: y = 1*1 + 5 = 6.
+
 use corewarp::{BackendKind, CoreWarp, Operation, Priority, SchedulingPolicy};
 
 fn main() -> corewarp::Result<()> {
@@ -26,7 +34,8 @@ fn main() -> corewarp::Result<()> {
     )?;
     rt.wait(&handle)?;
 
-    // 2º submit no mesmo y: deve reutilizar device residente (sem H2D de x se limpo).
+    // Second submit on the same y: should reuse the resident device copies
+    // (no H2D of x if it is still clean / not host_dirty).
     let handle2 = rt.submit(Operation::Saxpy {
         alpha: 1.0,
         x,
@@ -49,7 +58,7 @@ fn main() -> corewarp::Result<()> {
         y_host[0]
     );
 
-    // 1º: y=3*1+2=5; 2º: y=1*1+5=6
+    // 1st: y=3*1+2=5; 2nd: y=1*1+5=6
     if (y_host[0] - 6.0).abs() > 0.1 {
         eprintln!("unexpected y[0]={}", y_host[0]);
         std::process::exit(2);

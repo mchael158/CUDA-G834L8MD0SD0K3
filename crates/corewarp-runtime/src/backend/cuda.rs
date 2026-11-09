@@ -1,4 +1,74 @@
-//! CUDA: buffers residentes, pinned staging e timing por CudaEvent.
+//! CUDA backend for CoreWarp: device execution, memory residency, and staged timing.
+//!
+//! # Architecture overview
+//!
+//! This module implements the [`Backend`] trait using NVIDIA CUDA via `cudarc`. Work is issued
+//! onto independent CUDA streams (one per scheduling slot) so multiple jobs can overlap in flight.
+//!
+//! ## Resident device buffers
+//!
+//! Each logical host buffer ([`BufferId`]) that participates in GPU operations may have a matching
+//! [`Resident`] entry in `CudaBackend::resident`: a [`CudaSlice<f32>`] on the device whose logical
+//! length is tracked separately from the pooled allocation size. Residents persist across jobs until
+//! [`Backend::free_device`] or shutdown returns the slice to the pool. Kernels read/write through
+//! `take_resident` / `put_resident` so the hash map can be temporarily bypassed without cloning
+//! device memory.
+//!
+//! ## Pinned staging (H2D path)
+//!
+//! Host-to-device uploads do not call `memcpy_htod` directly from the CPU heap backing
+//! [`MemoryManager`]. Instead, each slot owns an optional [`PinnedHostSlice<f32>`] sized with
+//! [`pool_key`]: the next power of two of the element count, floored at 256 elements. The host
+//! vector is copied into the pinned buffer (padding the tail with zeros), then the full pinned
+//! region is copied to the resident device slice. This keeps H2D transfers page-locked and aligns
+//! staging size with device pool keys.
+//!
+//! ## Dirty-flag driven H2D
+//!
+//! [`MemoryManager`] tracks `host_dirty` per buffer. [`ensure_resident`] allocates a resident slice
+//! on first use, then runs [`h2d_buffer`] only when the buffer is newly resident or `host_dirty` is
+//! set. After a successful upload, `host_dirty` is cleared. Device-side writes mark outputs via
+//! `written` and `finish_slot` sets `device_dirty` on the host metadata when appropriate.
+//!
+//! ## Device pool (`next_power_of_two` keys)
+//!
+//! [`DevicePool`] reuses freed [`CudaSlice<f32>`] allocations keyed by [`pool_key(elems)`], which
+//! is `elems.next_power_of_two().max(256)`. Acquire pops a slice of the requested key or allocates
+//! zeros on miss; release pushes slices back after temporary buffers (e.g. prefix-sum block sums,
+//! reduction partials) are done. Hit/miss counts feed [`RuntimeMetrics`].
+//!
+//! ## `CudaEvent` timing stages (h2d / kernel / d2h)
+//!
+//! Each issued job records [`StageEvents`]:
+//! - **h2d**: from `h2d_start` through `h2d_end` (after all `ensure_resident` work on the stream).
+//! - **kernel**: from `h2d_end` through `kernel_end` (after all kernel launches).
+//! - **d2h**: optional; when reduction schedules a device-to-host of partial sums, `d2h_end` is
+//!   recorded on the same stream so kernel time excludes that memcpy. Overall GPU wall time uses
+//!   either `h2d_start`→`d2h_end` or `h2d_start`→`kernel_end`.
+//!
+//! Completion is tracked with a separate non-timing `done` event (`CU_EVENT_DISABLE_TIMING`).
+//!
+//! ## Prefix scan (two-level)
+//!
+//! [`Operation::PrefixSum`] runs three kernels in sequence (see Rust docs above each `const` / load):
+//! 1. **`scan_blocks`**: per-block inclusive scan of input into output; per-block totals in `block_sums`.
+//! 2. **`scan_small_inclusive`**: single-block inclusive scan over at most 256 block sums (limit `blocks <= 256`).
+//! 3. **`add_block_offsets`**: add exclusive prefix of block totals into each element past block 0.
+//!
+//! Temporary `d_block` memory comes from the device pool and is released in `finish_slot`.
+//!
+//! ## Histogram
+//!
+//! [`Operation::Histogram`] first launches **`fill_zero`** to clear the output bin buffer, then
+//! **`histogram`**, which maps each input value into `[min_v, max_v)`, clamps the normalized coordinate,
+//! and accumulates with `atomicAdd` into bin counters (stored as `f32`).
+//!
+//! ## Reduction
+//!
+//! [`Operation::ReductionSum`] launches **`reduce_block`** to produce one partial sum per thread block.
+//! Partials are copied to a **dedicated** pinned buffer (not the slot's H2D staging), and stored in
+//! [`Slot::pending_reduce`]. The final scalar sum is computed on the **host** inside [`finish_slot`]
+//! only after the job's `done` event reports completion—GPU time does not include that CPU reduction.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,6 +86,10 @@ use corewarp_core::{Error, Result};
 use corewarp_memory::MemoryManager;
 use corewarp_telemetry::{JobMetrics, RuntimeMetrics};
 
+/// Embedded CUDA C source compiled at backend initialization via NVRTC.
+///
+/// Kernel bodies must remain byte-identical to the shipped implementation; behavior is documented
+/// in the module-level docs and in comments on the corresponding [`CudaFunction`] fields.
 const KERNELS: &str = r#"
 extern "C" __global__ void saxpy(float a, const float* x, float* y, size_t n) {
     size_t i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -106,10 +180,12 @@ extern "C" __global__ void histogram(const float* in, float* hist, size_t n, flo
 }
 "#;
 
+/// Maps a `cudarc` driver error into [`Error::Backend`] with debug formatting.
 fn cu_err(err: impl std::fmt::Debug) -> Error {
     Error::Backend(format!("{err:?}"))
 }
 
+/// Default 1-D launch configuration: 256 threads per block, enough blocks to cover `n` elements.
 fn launch_cfg(n: u32) -> LaunchConfig {
     LaunchConfig {
         grid_dim: ((n + 255) / 256, 1, 1),
@@ -118,21 +194,28 @@ fn launch_cfg(n: u32) -> LaunchConfig {
     }
 }
 
+/// Pool and pinned staging capacity key: smallest power-of-two >= `elems`, at least 256.
 fn pool_key(elems: usize) -> usize {
     elems.next_power_of_two().max(256)
 }
 
+/// Reusable device allocations indexed by [`pool_key`] size.
+///
+/// Avoids `cudaMalloc` for ephemeral buffers (prefix block sums, reduction partials) and for
+/// resident backing storage returned on `free_device` / shutdown.
 struct DevicePool {
     free: HashMap<usize, Vec<CudaSlice<f32>>>,
 }
 
 impl DevicePool {
+    /// Creates an empty pool (no pre-allocation).
     fn new() -> Self {
         Self {
             free: HashMap::new(),
         }
     }
 
+    /// Returns a device slice with length `pool_key(elems)`; reuses a free list entry or allocates zeros.
     fn acquire(
         &mut self,
         stream: &Arc<CudaStream>,
@@ -150,17 +233,20 @@ impl DevicePool {
         stream.alloc_zeros::<f32>(key).map_err(cu_err)
     }
 
+    /// Returns a slice to the free list for its keyed capacity (logical `elems` before rounding).
     fn release(&mut self, elems: usize, slice: CudaSlice<f32>) {
         let key = pool_key(elems);
         self.free.entry(key).or_default().push(slice);
     }
 }
 
+/// Device-side mirror of a host buffer: pooled slice plus logical element count.
 struct Resident {
     device: CudaSlice<f32>,
     len: usize,
 }
 
+/// CUDA events bracketing H2D, kernel, and optional in-stream D2H for one job.
 struct StageEvents {
     h2d_start: CudaEvent,
     h2d_end: CudaEvent,
@@ -168,6 +254,7 @@ struct StageEvents {
     d2h_end: Option<CudaEvent>,
 }
 
+/// Per-stream execution context while a job is in flight or idle.
 struct Slot {
     stream: Arc<CudaStream>,
     busy: bool,
@@ -175,26 +262,38 @@ struct Slot {
     done: Option<CudaEvent>,
     buffer_ids: Vec<BufferId>,
     written: Vec<BufferId>,
-    /// Partials pinned para reduction (somatório só após done).
+    /// Reduction partials in pinned host memory; scalar sum applied in `finish_slot` after `done`.
     pending_reduce: Option<(BufferId, PinnedHostSlice<f32>, usize)>,
     temps: Vec<(usize, CudaSlice<f32>)>,
     stages: Option<StageEvents>,
     pinned: Option<PinnedHostSlice<f32>>,
 }
 
+/// CUDA implementation of [`Backend`]: NVRTC module, kernel functions, stream slots, pool, residents.
 pub(crate) struct CudaBackend {
     ctx: Arc<CudaContext>,
     _module: Arc<CudaModule>,
+    /// `y <- alpha * x + y`
     saxpy: CudaFunction,
+    /// Element-wise vector add.
     vadd: CudaFunction,
+    /// Element-wise scale.
     vscale: CudaFunction,
+    /// Block-local sum into partial array (reduction stage 1).
     reduce_block: CudaFunction,
+    /// Affine normalize with host-provided mean and inverse std.
     normalize: CudaFunction,
+    /// Integrate 6-float particle records (position + velocity) with gravity on Y.
     particle_update: CudaFunction,
+    /// Per-256-block inclusive scan + block sum extraction (prefix stage 1).
     scan_blocks: CudaFunction,
+    /// Inclusive scan of up to 256 block sums in one block (prefix stage 2).
     scan_small_inclusive: CudaFunction,
+    /// Add exclusive prefix of block totals into output (prefix stage 3).
     add_block_offsets: CudaFunction,
+    /// Zero-fill histogram output before atomic accumulation.
     fill_zero: CudaFunction,
+    /// Bin input values with `atomicAdd` after `fill_zero`.
     histogram: CudaFunction,
     slots: Vec<Slot>,
     device_pool: DevicePool,
@@ -202,6 +301,7 @@ pub(crate) struct CudaBackend {
 }
 
 impl CudaBackend {
+    /// Builds context, compiles [`KERNELS`], loads functions, and creates `stream_count` idle slots.
     pub(crate) fn new(stream_count: usize) -> Result<Self> {
         let ctx = CudaContext::new(0).map_err(cu_err)?;
         let ptx = compile_ptx(KERNELS).map_err(cu_err)?;
@@ -255,12 +355,14 @@ impl CudaBackend {
         })
     }
 
+    /// Allocates a CUDA event with default timing flags for stage measurement.
     fn timing_event(&self) -> Result<CudaEvent> {
         self.ctx
             .new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
             .map_err(cu_err)
     }
 
+    /// Grows the slot's pinned staging buffer to at least `pool_key(elems)` elements.
     fn ensure_pinned(&mut self, slot_idx: usize, elems: usize) -> Result<()> {
         let need = pool_key(elems);
         let cur = self.slots[slot_idx]
@@ -269,13 +371,14 @@ impl CudaBackend {
             .map(|p| p.len())
             .unwrap_or(0);
         if cur < need {
-            // SAFETY: alocação pinned gerenciada pelo Drop de PinnedHostSlice.
+            // SAFETY: pinned allocation lifetime is managed by `PinnedHostSlice` on drop.
             let pin = unsafe { self.ctx.alloc_pinned::<f32>(need) }.map_err(cu_err)?;
             self.slots[slot_idx].pinned = Some(pin);
         }
         Ok(())
     }
 
+    /// Ensures a resident device allocation exists and is synchronized from host when dirty or new.
     fn ensure_resident(
         &mut self,
         id: BufferId,
@@ -300,6 +403,7 @@ impl CudaBackend {
         Ok(())
     }
 
+    /// Copies host buffer contents through pinned staging into the resident device slice on `stream`.
     fn h2d_buffer(
         &mut self,
         id: BufferId,
@@ -319,14 +423,14 @@ impl CudaBackend {
             dst[len..].fill(0.0);
         }
 
-        // pin.len() == device.len() == pool_key(len); copia bloco inteiro.
+        // `pin.len()` == `device.len()` == `pool_key(len)`; copy the full pooled extent.
         let pin = self.slots[slot_idx].pinned.as_ref().expect("pinned");
         let resident = self
             .resident
             .get_mut(&id.0)
-            .ok_or(Error::Backend("resident ausente".into()))?;
+            .ok_or(Error::Backend("resident missing".into()))?;
         if resident.device.len() < pin.len() {
-            return Err(Error::Backend("device menor que pinned staging".into()));
+            return Err(Error::Backend("device smaller than pinned staging".into()));
         }
         stream
             .memcpy_htod(pin, &mut resident.device)
@@ -335,16 +439,19 @@ impl CudaBackend {
         Ok(())
     }
 
+    /// Removes and returns the resident entry for kernel launches (caller must `put_resident` after).
     fn take_resident(&mut self, id: BufferId) -> Result<Resident> {
         self.resident
             .remove(&id.0)
-            .ok_or(Error::Backend("buffer device ausente".into()))
+            .ok_or(Error::Backend("device buffer missing".into()))
     }
 
+    /// Re-inserts a resident after kernels complete.
     fn put_resident(&mut self, id: BufferId, r: Resident) {
         self.resident.insert(id.0, r);
     }
 
+    /// Tears down slot state after `done`, fills metrics, host reduction, dirty flags, pool release.
     fn finish_slot(
         &mut self,
         idx: usize,
@@ -388,7 +495,7 @@ impl CudaBackend {
                     entry.host_dirty = true;
                     entry.device_dirty = false;
                 }
-                // Mantém device output coerente no próximo ensure (host_dirty).
+                // Device copy of scalar output stays stale until next `ensure_resident` sees `host_dirty`.
             }
         }
 
@@ -422,6 +529,7 @@ impl Backend for CudaBackend {
         self.slots.iter().filter(|s| s.busy).count()
     }
 
+    /// Records stage events, uploads residents, launches kernels for `op`, and arms `done` on the slot.
     fn try_issue(
         &mut self,
         slot_idx: usize,
@@ -451,6 +559,7 @@ impl Backend for CudaBackend {
         h2d_end.record(&stream).map_err(cu_err)?;
 
         match *op {
+            // BLAS-style `y <- alpha * x + y` on device resident slices.
             Operation::Saxpy { alpha, x, y } => {
                 let n = memory.len_of(x)?;
                 let d_x = self.take_resident(x)?;
@@ -468,6 +577,7 @@ impl Backend for CudaBackend {
                 self.put_resident(y, d_y);
                 written.push(y);
             }
+            // `output[i] = a[i] + b[i]`.
             Operation::VectorAdd { a, b, output } => {
                 let n = memory.len_of(a)?;
                 let d_a = self.take_resident(a)?;
@@ -488,6 +598,7 @@ impl Backend for CudaBackend {
                 self.put_resident(output, d_o);
                 written.push(output);
             }
+            // `output[i] = alpha * input[i]`.
             Operation::VectorScale {
                 alpha,
                 input,
@@ -509,6 +620,7 @@ impl Backend for CudaBackend {
                 self.put_resident(output, d_out);
                 written.push(output);
             }
+            // Block partial sums D2H to pinned buffer; final add on host in `finish_slot`.
             Operation::ReductionSum { input, output } => {
                 let n = memory.len_of(input)?;
                 let blocks = ((n as u32) + 255) / 256;
@@ -532,7 +644,7 @@ impl Backend for CudaBackend {
                 .map_err(cu_err)?;
                 self.put_resident(input, d_in);
 
-                // Pinned dedicado aos parciais (não reutiliza staging H2D do slot).
+                // Dedicated pinned buffer for partials (does not reuse slot H2D staging).
                 let mut pin =
                     unsafe { self.ctx.alloc_pinned::<f32>(blocks as usize) }.map_err(cu_err)?;
                 let view = d_partial.slice(..blocks as usize);
@@ -542,6 +654,7 @@ impl Backend for CudaBackend {
                 temps.push((blocks as usize, d_partial));
                 written.push(output);
             }
+            // `(input - mean) * inv_std` element-wise.
             Operation::Normalize {
                 input,
                 output,
@@ -565,6 +678,7 @@ impl Backend for CudaBackend {
                 self.put_resident(output, d_out);
                 written.push(output);
             }
+            // Six floats per particle: integrate velocity with gravity, then positions.
             Operation::ParticleUpdate {
                 state,
                 delta_time,
@@ -584,13 +698,14 @@ impl Backend for CudaBackend {
                 self.put_resident(state, d_state);
                 written.push(state);
             }
+            // Two-level inclusive prefix sum: `scan_blocks`, `scan_small_inclusive`, `add_block_offsets`.
             Operation::PrefixSum { input, output } => {
                 const SCAN_BLOCK: u32 = 256;
                 let n = memory.len_of(input)?;
                 let blocks = ((n as u32) + SCAN_BLOCK - 1) / SCAN_BLOCK;
                 if blocks > 256 {
                     return Err(Error::Invalid(
-                        "prefix_sum CUDA: n > 65536 não suportado no 0.1",
+                        "prefix_sum CUDA: n > 65536 not supported in 0.1",
                     ));
                 }
                 let d_in = self.take_resident(input)?;
@@ -650,6 +765,7 @@ impl Backend for CudaBackend {
                 temps.push((blocks as usize, d_block));
                 written.push(output);
             }
+            // Clear bins with `fill_zero`, then `histogram` with `atomicAdd` per sample.
             Operation::Histogram {
                 input,
                 output,
@@ -720,6 +836,7 @@ impl Backend for CudaBackend {
         Ok(())
     }
 
+    /// Non-blocking poll of each slot's `done` event; completes slots via `finish_slot`.
     fn poll_completions(
         &mut self,
         memory: &mut MemoryManager,
@@ -731,7 +848,7 @@ impl Backend for CudaBackend {
             if !self.slots[i].busy {
                 continue;
             }
-            let event = self.slots[i].done.as_ref().expect("busy sem event");
+            let event = self.slots[i].done.as_ref().expect("busy without event");
             match event.try_is_complete() {
                 Ok(true) => out.push(self.finish_slot(i, memory, metrics, None)),
                 Ok(false) => {}
@@ -743,6 +860,7 @@ impl Backend for CudaBackend {
         Ok(out)
     }
 
+    /// Synchronous D2H on stream 0 when `device_dirty`; copies pinned slice into host memory.
     fn prepare_download(
         &mut self,
         id: BufferId,
@@ -755,10 +873,10 @@ impl Backend for CudaBackend {
         }
         let len = entry.len;
         if !self.resident.contains_key(&id.0) {
-            return Err(Error::Backend("download: device ausente".into()));
+            return Err(Error::Backend("download: device missing".into()));
         }
 
-        // Usa stream 0 para D2H síncrono de download.
+        // Stream 0 performs synchronous download D2H.
         let stream = self.slots[0].stream.clone();
         self.ensure_pinned(0, len)?;
 
@@ -782,6 +900,7 @@ impl Backend for CudaBackend {
         Ok(())
     }
 
+    /// Drops resident mapping and returns device memory to the pool.
     fn free_device(&mut self, id: BufferId, metrics: &mut RuntimeMetrics) -> Result<()> {
         if let Some(r) = self.resident.remove(&id.0) {
             self.device_pool.release(r.len, r.device);
@@ -790,6 +909,7 @@ impl Backend for CudaBackend {
         Ok(())
     }
 
+    /// Waits on in-flight events and returns all resident allocations to the pool.
     fn shutdown(&mut self) -> Result<()> {
         for slot in &mut self.slots {
             if let Some(ev) = slot.done.take() {
@@ -803,7 +923,7 @@ impl Backend for CudaBackend {
             slot.written.clear();
             slot.stages = None;
         }
-        // Devolve residentes ao pool.
+        // Return all residents to the device pool.
         let keys: Vec<u64> = self.resident.keys().copied().collect();
         for k in keys {
             if let Some(r) = self.resident.remove(&k) {

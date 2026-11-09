@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Pools, lifetime e dirty flags de buffers"
+description = "Host size-class pools, buffer lifetime, and dirty flags"
 
 [dependencies]
 corewarp-core = { workspace = true }

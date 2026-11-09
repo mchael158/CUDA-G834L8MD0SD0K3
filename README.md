@@ -1,15 +1,15 @@
 # CoreWarp
 
-**GPU Compute Toolkit** em Rust — primitivas reutilizáveis, runtime de memória/execução e packs **AI** + **Game** sobre o mesmo núcleo.
+**GPU Compute Toolkit** in Rust — reusable primitives, a memory/execution runtime, and **AI** + **Game** packs on the same core.
 
 ## Workspace
 
 ```text
-crates/corewarp-core        tipos e erros
-crates/corewarp-telemetry   métricas
+crates/corewarp-core        types and errors
+crates/corewarp-telemetry   metrics
 crates/corewarp-memory      pools + dirty flags
 crates/corewarp-runtime     Device / Buffer / Submission + CUDA/host
-crates/corewarp-kernels     ops compartilhadas
+crates/corewarp-kernels     shared ops
 crates/corewarp-ai          normalize, …
 crates/corewarp-game        particle update, …
 crates/corewarp             facade + prelude
@@ -17,7 +17,7 @@ crates/corewarp             facade + prelude
 
 ## Build
 
-```bat
+```bash
 cargo test -p corewarp-runtime --release
 cargo run -p corewarp --release --example pipeline_sim
 cargo run -p corewarp --release --example image_processing
@@ -28,12 +28,12 @@ cargo run -p corewarp --release --example bench_host
 
 CUDA:
 
-```bat
+```bash
 cargo run -p corewarp --release --example saxpy_cuda --features cuda
 cargo run -p corewarp --release --example bench_manual_vs_runtime --features cuda
 ```
 
-## Uso
+## Usage
 
 ```rust
 use corewarp::prelude::*;
@@ -52,6 +52,6 @@ let result = device.download(&output)?;
 
 ## Docs
 
-- [product.md](docs/product.md) — identidade
-- [implementation-0.1.md](docs/implementation-0.1.md) — contratos 0.1
-- [architecture.md](docs/architecture.md) — runtime
+- [product.md](docs/product.md) — product identity
+- [implementation-0.1.md](docs/implementation-0.1.md) — 0.1 contracts
+- [architecture.md](docs/architecture.md) — runtime architecture

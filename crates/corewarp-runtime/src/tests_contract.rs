@@ -1,9 +1,16 @@
-//! Testes de contrato do runtime host (sem CUDA).
+//! Host-runtime contract tests (no CUDA required).
+//!
+//! These tests pin the 0.1 behavioral guarantees that application packs depend on:
+//! correct op results, priority ordering under a single slot, shape rejection,
+//! download waiting for completion, pool reuse after free, and serialization of
+//! overlapping writable buffers. Run with:
+//! `cargo test -p corewarp-runtime --release`.
 
 use corewarp_core::{BackendKind, Error, Operation, Priority, SchedulingPolicy};
 
 use crate::CoreWarp;
 
+/// Build a small Fixed host runtime used by most tests.
 fn host_rt() -> CoreWarp {
     CoreWarp::builder()
         .backend(BackendKind::Host)
@@ -15,6 +22,7 @@ fn host_rt() -> CoreWarp {
         .unwrap()
 }
 
+/// SAXPY, VectorAdd, VectorScale, and ReductionSum must match host reference math.
 #[test]
 fn saxpy_vector_ops_and_reduction() {
     let mut rt = host_rt();
@@ -24,6 +32,7 @@ fn saxpy_vector_ops_and_reduction() {
         .submit(Operation::Saxpy { alpha: 3.0, x, y })
         .unwrap();
     rt.wait(&h).unwrap();
+    // y = 2 + 3*1 = 5
     assert_eq!(rt.download(y).unwrap(), vec![5.0, 5.0, 5.0, 5.0]);
 
     let a = rt.upload(&[1.0, 2.0]).unwrap();
@@ -56,6 +65,7 @@ fn saxpy_vector_ops_and_reduction() {
     assert_eq!(rt.download(red_out).unwrap(), vec![10.0]);
 }
 
+/// Inclusive prefix-sum: [1,2,3,4] → [1,3,6,10].
 #[test]
 fn prefix_sum_inclusive() {
     let mut rt = host_rt();
@@ -67,10 +77,12 @@ fn prefix_sum_inclusive() {
     assert_eq!(rt.download(output).unwrap(), vec![1.0, 3.0, 6.0, 10.0]);
 }
 
+/// Histogram over [0, 10) with 5 bins of width 2.
 #[test]
 fn histogram_bins() {
     let mut rt = host_rt();
-    // valores em [0, 10) → 5 bins de largura 2
+    // Values in [0, 10) → 5 bins of width 2:
+    // 0.0,1.5 → bin0; 2.0 → bin1; 4.9 → bin2; 9.9 → bin4
     let input = rt.upload(&[0.0, 1.5, 2.0, 4.9, 9.9]).unwrap();
     let output = rt.alloc_zeros(5).unwrap();
     rt.submit(Operation::Histogram {
@@ -84,11 +96,12 @@ fn histogram_bins() {
     assert_eq!(rt.download(output).unwrap(), vec![2.0, 1.0, 1.0, 0.0, 1.0]);
 }
 
+/// With a single slot, High priority must be issued before Low.
 #[test]
 fn priority_high_emitted_before_low() {
     let mut rt = CoreWarp::builder()
         .backend(BackendKind::Host)
-        .streams(1) // força serializar emissão
+        .streams(1) // force serialized issue
         .issue_width(1)
         .max_in_flight(1)
         .scheduling(SchedulingPolicy::Fixed)
@@ -121,7 +134,7 @@ fn priority_high_emitted_before_low() {
         .unwrap();
 
     rt.poll().unwrap();
-    // Com 1 slot: só o High deve estar Running/Completed; Low ainda Queued.
+    // With 1 slot: only High should be Running/Completed; Low still Queued.
     use corewarp_core::JobStatus;
     assert_ne!(rt.status(&low).unwrap(), JobStatus::Running);
     assert!(matches!(
@@ -133,6 +146,7 @@ fn priority_high_emitted_before_low() {
     assert!(rt.is_complete(&low).unwrap());
 }
 
+/// Mismatched lengths must be rejected at submit time (no partial enqueue).
 #[test]
 fn rejects_bad_shapes() {
     let mut rt = host_rt();
@@ -151,6 +165,7 @@ fn rejects_bad_shapes() {
     assert!(matches!(err, Error::Invalid(_)));
 }
 
+/// `download` must internally poll until the buffer is no longer in-flight.
 #[test]
 fn download_waits_until_complete() {
     let mut rt = host_rt();
@@ -158,11 +173,12 @@ fn download_waits_until_complete() {
     let y = rt.upload(&vec![0.0; 1024]).unwrap();
     rt.submit(Operation::Saxpy { alpha: 2.0, x, y })
         .unwrap();
-    // download faz poll interno até in_flight==0
+    // download polls internally until in_flight == 0
     let out = rt.download(y).unwrap();
     assert!((out[0] - 2.0).abs() < 1e-5);
 }
 
+/// Freeing a Small-class buffer then re-uploading the same size should hit the pool.
 #[test]
 fn pool_reuses_after_free() {
     let mut rt = host_rt();
@@ -170,23 +186,27 @@ fn pool_reuses_after_free() {
     rt.free_buffer(a).unwrap();
     let b = rt.upload(&vec![2.0; 64]).unwrap();
     let m = rt.metrics();
-    assert!(m.pool_hits >= 1, "esperava hit no pool após free+upload");
+    assert!(
+        m.pool_hits >= 1,
+        "expected a pool hit after free+upload of the same size class"
+    );
     let _ = b;
 }
 
+/// Two SAXPYs writing the same `y` must serialize so the final result is 2.0, not a race.
 #[test]
 fn serializes_overlapping_writable_buffers() {
     let mut rt = host_rt();
     let x = rt.upload(&[1.0; 8]).unwrap();
     let y = rt.upload(&[0.0; 8]).unwrap();
 
-    // Dois SAXPY no mesmo y: devem serializar (não corromper).
+    // Two SAXPYs on the same y: must serialize (no corruption).
     rt.submit(Operation::Saxpy { alpha: 1.0, x, y })
         .unwrap();
     rt.submit(Operation::Saxpy { alpha: 1.0, x, y })
         .unwrap();
     rt.drain().unwrap();
     let out = rt.download(y).unwrap();
-    // y = 0 + 1*x = 1; depois 1 + 1*x = 2
+    // First: y = 0 + 1*x = 1; second: y = 1 + 1*x = 2
     assert!((out[0] - 2.0).abs() < 1e-5);
 }

@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Operações GPU compartilhadas (reduction, scale, …)"
+description = "Shared high-level GPU ops (saxpy, scan, histogram, …)"
 
 [dependencies]
 corewarp-core = { workspace = true }

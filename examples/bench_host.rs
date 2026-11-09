@@ -1,10 +1,15 @@
-//! Bench host: throughput do runtime sem CUDA (sempre roda).
+//! Host throughput bench: scheduler + pool without CUDA (always runnable).
+//!
+//! Measures jobs/s for a wave of SAXPYs, then repeats after free+re-upload to
+//! show pool reuse (pool_hits). Run with:
+//! `cargo run -p corewarp --release --example bench_host`
+
 use std::time::Instant;
 
 use corewarp::{BackendKind, CoreWarp, Operation, SchedulingPolicy};
 
 fn main() -> corewarp::Result<()> {
-    const N: usize = 1 << 12; // 16 KiB → classe Medium
+    const N: usize = 1 << 12; // 16 KiB → Medium size class
     const JOBS: usize = 256;
 
     let mut rt = CoreWarp::builder()
@@ -40,7 +45,7 @@ fn main() -> corewarp::Result<()> {
         m.pool_misses
     );
 
-    // Reuso: free + re-upload
+    // Reuse path: free every y, then re-upload + submit again (expect pool hits).
     for y in ys {
         rt.free_buffer(y)?;
     }

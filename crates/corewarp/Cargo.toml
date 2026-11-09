@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "GPU Compute Toolkit — facade"
+description = "CoreWarp GPU Compute Toolkit — public facade crate"
 
 [features]
 default = ["host"]

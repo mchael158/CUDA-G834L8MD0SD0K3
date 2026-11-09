@@ -1,32 +1,32 @@
-# CoreWarp — identidade de produto
+# CoreWarp — product identity
 
-**Categoria:** GPU Compute Toolkit  
-**Linguagem:** Rust 2021  
+**Category:** GPU Compute Toolkit  
+**Language:** Rust 2021  
 **Backends 0.1:** Host + CUDA (`cudarc` 0.19)  
-**Domínios:** AI + Game sobre o mesmo runtime  
-**Licença alvo:** MIT OR Apache-2.0  
+**Domains:** AI + Game on the same runtime  
+**Target license:** MIT OR Apache-2.0  
 
-## Tese
+## Thesis
 
-Biblioteca de **primitivas GPU reutilizáveis** com runtime de memória, execução assíncrona e telemetria. Não é framework de IA, engine de jogos nem substituto do CUDA.
+A library of **reusable GPU primitives** with a memory runtime, asynchronous execution, and telemetry. It is not an AI framework, a game engine, or a CUDA replacement.
 
-## Camadas
+## Layers
 
 ```text
-corewarp-ai / corewarp-game     ← packs de domínio
-corewarp-kernels                ← ops compartilhadas
+corewarp-ai / corewarp-game     ← domain packs
+corewarp-kernels                ← shared ops
 corewarp-runtime                ← Device, submit, streams, events
 corewarp-memory                 ← pools, lifetime, dirty flags
-corewarp-core + telemetry       ← tipos, erros, métricas
+corewarp-core + telemetry       ← types, errors, metrics
 ```
 
-## Diferenciais (0.1)
+## Differentiators (0.1)
 
-1. Primitivas reutilizáveis (não só launch de kernel)
-2. Execução memory-aware (buffers residentes + dirty flags)
-3. Composição sem download obrigatório entre ops
-4. Benchmarking / métricas por estágio
+1. Reusable primitives (not just kernel launch)
+2. Memory-aware execution (resident buffers + dirty flags)
+3. Composition without mandatory download between ops
+4. Benchmarking / per-stage metrics
 
-## Fora de escopo (0.1)
+## Out of scope (0.1)
 
-GUI, multi-GPU, Vulkan, CUDA Graphs próprios, substituir cuBLAS/cuDNN/TensorRT.
+GUI, multi-GPU, Vulkan, custom CUDA Graphs, replacing cuBLAS/cuDNN/TensorRT.

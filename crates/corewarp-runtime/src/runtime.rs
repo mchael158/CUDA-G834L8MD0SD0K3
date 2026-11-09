@@ -1,3 +1,12 @@
+//! Internal CoreWarp orchestrator: memory, scheduler, conflict locks, backends.
+//!
+//! [`CoreWarp::poll`] is the heart of the system:
+//! 1. Age waiting jobs and collect backend completions (releasing locks).
+//! 2. Issue up to `issue_width` non-conflicting jobs into free backend slots.
+//! 3. Push deferred (conflicted / Busy) jobs back to the front of the queue.
+//!
+//! Public Device methods mostly forward here. Prefer Device for application code.
+
 use std::collections::HashMap;
 
 use corewarp_core::{
@@ -13,6 +22,7 @@ use crate::scheduler::Scheduler;
 #[cfg(feature = "cuda")]
 use crate::backend::CudaBackend;
 
+/// Type-erased backend storage so Host and CUDA share one runtime path.
 enum BackendBox {
     Host(HostBackend),
     #[cfg(feature = "cuda")]
@@ -37,30 +47,41 @@ impl BackendBox {
     }
 }
 
+/// Per-job bookkeeping kept outside the scheduler queue after issue.
 struct JobRecord {
     status: JobStatus,
     fail: Option<String>,
     metrics: JobMetrics,
 }
 
-/// Runtime interno: fila, memória e backends.
+/// Runtime internal: queue, memory, conflict locks, and backends.
+///
+/// Conflict locking uses refcounted sets of active read/write buffer IDs so two
+/// jobs that touch the same writable buffer never run concurrently, while
+/// independent jobs may overlap across streams.
 pub struct CoreWarp {
     memory: MemoryManager,
     scheduler: Scheduler,
     backend: BackendBox,
     jobs: HashMap<u64, JobRecord>,
     metrics: RuntimeMetrics,
+    /// Refcount of buffers currently being read by in-flight jobs.
     active_reads: HashMap<BufferId, u32>,
+    /// Refcount of buffers currently being written by in-flight jobs.
     active_writes: HashMap<BufferId, u32>,
+    /// Maps job id → (reads, writes) so completions can release the right locks.
     inflight_buffers: HashMap<u64, (Vec<BufferId>, Vec<BufferId>)>,
 }
 
+/// Builder for [`CoreWarp`]. See method docs for each tunable.
 pub struct CoreWarpBuilder {
     cfg: RuntimeConfig,
+    /// When true, CUDA init failure is fatal instead of falling back to host.
     require_cuda: bool,
 }
 
 impl CoreWarp {
+    /// Start a builder with default [`RuntimeConfig`].
     pub fn builder() -> CoreWarpBuilder {
         CoreWarpBuilder {
             cfg: RuntimeConfig::default(),
@@ -68,33 +89,40 @@ impl CoreWarp {
         }
     }
 
+    /// `"host"` or `"cuda"` after [`CoreWarpBuilder::build`].
     pub fn backend_name(&self) -> &'static str {
         self.backend.name()
     }
 
+    /// Copy of aggregate counters (cheap; metrics are Copy).
     pub fn metrics(&self) -> RuntimeMetrics {
         self.metrics
     }
 
+    /// Stage timings for a known job handle.
     pub fn job_metrics(&self, handle: &JobHandle) -> Result<JobMetrics> {
         self.jobs
             .get(&handle.id.0)
             .map(|j| j.metrics)
-            .ok_or(Error::Invalid("job inexistente"))
+            .ok_or(Error::Invalid("job does not exist"))
     }
 
+    /// Upload host data through the memory manager.
     pub fn upload(&mut self, data: &[f32]) -> Result<BufferId> {
         self.memory.upload(data, &mut self.metrics)
     }
 
+    /// Allocate a zero-filled buffer.
     pub fn alloc_zeros(&mut self, len: usize) -> Result<BufferId> {
         self.memory.alloc_zeros(len, &mut self.metrics)
     }
 
+    /// Enqueue at Normal priority.
     pub fn submit(&mut self, op: Operation) -> Result<JobHandle> {
         self.submit_with_priority(Priority::Normal, op)
     }
 
+    /// Validate shapes, retain buffers, enqueue, and record a Queued job.
     pub fn submit_with_priority(&mut self, priority: Priority, op: Operation) -> Result<JobHandle> {
         op.validate_shapes(|id| self.memory.len_of(id))?;
         let ids = op.buffer_ids();
@@ -112,13 +140,15 @@ impl CoreWarp {
         Ok(JobHandle { id })
     }
 
+    /// Current lifecycle status of a job.
     pub fn status(&self, handle: &JobHandle) -> Result<JobStatus> {
         self.jobs
             .get(&handle.id.0)
             .map(|j| j.status)
-            .ok_or(Error::Invalid("job inexistente"))
+            .ok_or(Error::Invalid("job does not exist"))
     }
 
+    /// True once the job is Completed or Failed.
     pub fn is_complete(&self, handle: &JobHandle) -> Result<bool> {
         Ok(matches!(
             self.status(handle)?,
@@ -126,10 +156,15 @@ impl CoreWarp {
         ))
     }
 
+    /// One scheduling tick: complete finished work, then issue new work.
+    ///
+    /// Returns how many jobs completed in this tick. Safe to call in a tight loop
+    /// from `wait` / `drain` / `download`.
     pub fn poll(&mut self) -> Result<usize> {
         self.metrics.polls += 1;
         self.scheduler.age_waiting();
 
+        // --- Completions -------------------------------------------------------
         let completed = self
             .backend
             .as_mut()
@@ -145,6 +180,7 @@ impl CoreWarp {
                 }
             }
             if let Some(rec) = self.jobs.get_mut(&work.job_id.0) {
+                // Preserve queue_wait measured at issue time; overlay backend stages.
                 let queue_wait_us = rec.metrics.queue_wait_us;
                 rec.metrics = work.metrics;
                 rec.metrics.queue_wait_us = queue_wait_us;
@@ -161,6 +197,7 @@ impl CoreWarp {
             self.scheduler.note_completed(depth);
         }
 
+        // --- Issue wave --------------------------------------------------------
         let width = self.scheduler.issue_width;
         let active = self
             .scheduler
@@ -180,6 +217,7 @@ impl CoreWarp {
             let active_reads: Vec<_> = self.active_reads.keys().copied().collect();
             let active_writes: Vec<_> = self.active_writes.keys().copied().collect();
             if job.op.conflicts_with(&active_reads, &active_writes) {
+                // Cannot issue now without racing; retry next poll.
                 deferred.push(job);
                 continue;
             }
@@ -210,8 +248,9 @@ impl CoreWarp {
                         issued = true;
                         break;
                     }
-                    Err(Error::Busy) => continue,
+                    Err(Error::Busy) => continue, // try next slot
                     Err(e) => {
+                        // Hard failure at issue: release retains, mark Failed.
                         self.memory.release(&job.op.buffer_ids());
                         if let Some(rec) = self.jobs.get_mut(&job.id.0) {
                             rec.status = JobStatus::Failed;
@@ -228,12 +267,14 @@ impl CoreWarp {
                 break;
             }
         }
+        // Re-queue deferred jobs in reverse so relative order among them is kept.
         for job in deferred.into_iter().rev() {
             self.scheduler.push_front(job);
         }
         Ok(n_done)
     }
 
+    /// Spin-poll until the job is terminal; map Failed → [`Error::Failed`].
     pub fn wait(&mut self, handle: &JobHandle) -> Result<()> {
         loop {
             if self.is_complete(handle)? {
@@ -251,6 +292,7 @@ impl CoreWarp {
         }
     }
 
+    /// Spin-poll until nothing is pending or in-flight.
     pub fn drain(&mut self) -> Result<()> {
         loop {
             self.poll()?;
@@ -262,6 +304,7 @@ impl CoreWarp {
         }
     }
 
+    /// Wait for coherence, sync device→host if needed, then clone host storage.
     pub fn download(&mut self, id: BufferId) -> Result<Vec<f32>> {
         loop {
             self.poll()?;
@@ -276,6 +319,7 @@ impl CoreWarp {
         }
     }
 
+    /// Free device-resident storage (no-op on host) then recycle the host buffer.
     pub fn free_buffer(&mut self, id: BufferId) -> Result<()> {
         self.backend
             .as_mut()
@@ -283,11 +327,13 @@ impl CoreWarp {
         self.memory.free(id)
     }
 
+    /// Drain then ask the backend to release streams / resident pools.
     pub fn shutdown(mut self) -> Result<()> {
         self.drain()?;
         self.backend.as_mut().shutdown()
     }
 
+    /// Decrement a lock refcount and remove the key at zero.
     fn release_lock(map: &mut HashMap<BufferId, u32>, id: BufferId) {
         if let Some(count) = map.get_mut(&id) {
             *count = count.saturating_sub(1);
@@ -329,11 +375,13 @@ impl CoreWarpBuilder {
         self
     }
 
+    /// If true, CUDA construction errors propagate instead of host fallback.
     pub fn require_cuda(mut self, yes: bool) -> Self {
         self.require_cuda = yes;
         self
     }
 
+    /// Validate config and construct the runtime + selected backend.
     pub fn build(self) -> Result<CoreWarp> {
         let cfg = self.cfg;
         let require_cuda = self.require_cuda;
@@ -349,13 +397,16 @@ impl CoreWarpBuilder {
                     match CudaBackend::new(cfg.stream_count) {
                         Ok(b) => BackendBox::Cuda(b),
                         Err(e) if require_cuda => return Err(e),
+                        // Soft fallback only when require_cuda is false (legacy path).
                         Err(_) => BackendBox::Host(HostBackend::new(cfg.stream_count)),
                     }
                 }
                 #[cfg(not(feature = "cuda"))]
                 {
                     if require_cuda {
-                        return Err(Error::Backend("feature `cuda` não compilada".into()));
+                        return Err(Error::Backend(
+                            "feature `cuda` was not compiled into this binary".into(),
+                        ));
                     }
                     BackendBox::Host(HostBackend::new(cfg.stream_count))
                 }

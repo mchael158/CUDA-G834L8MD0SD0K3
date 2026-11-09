@@ -1,4 +1,9 @@
-//! Experimento 1: streams manuais vs CoreWarp (requer --features cuda).
+//! Experiment 1: raw multi-stream CUDA launches vs CoreWarp (requires `--features cuda`).
+//!
+//! Prints CSV rows comparing wall time for the same SAXPY workload under a
+//! hand-rolled stream pool versus the CoreWarp runtime. Run with:
+//! `cargo run -p corewarp --release --example bench_manual_vs_runtime --features cuda`
+
 use std::time::Instant;
 
 use corewarp::{BackendKind, CoreWarp, Operation, SchedulingPolicy};
@@ -12,6 +17,7 @@ extern "C" __global__ void saxpy(float a, const float* x, float* y, size_t n) {
 }
 "#;
 
+/// Baseline: one H2D+kernel+D2H per job, round-robin across `streams` CUDA streams.
 fn manual(n: usize, jobs: usize, streams: usize) -> Result<(f64, f32), String> {
     let ctx = CudaContext::new(0).map_err(|e| format!("{e:?}"))?;
     let ptx = compile_ptx(KERNEL).map_err(|e| format!("{e:?}"))?;
@@ -57,6 +63,7 @@ fn manual(n: usize, jobs: usize, streams: usize) -> Result<(f64, f32), String> {
     Ok((elapsed, y_hosts[0][0]))
 }
 
+/// CoreWarp path: upload once, submit many SAXPYs, drain, download one result.
 fn runtime(n: usize, jobs: usize, streams: usize) -> corewarp::Result<(f64, f32)> {
     let mut rt = CoreWarp::builder()
         .backend(BackendKind::Cuda)

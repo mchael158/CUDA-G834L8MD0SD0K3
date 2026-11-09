@@ -1,13 +1,17 @@
-//! Exemplo Game: particle update.
+//! Game-pack example: one Euler particle step on the host backend.
+//!
+//! Layout reminder: each particle is six floats `[px, py, pz, vx, vy, vz]`.
+//! Run with: `cargo run -p corewarp --release --example particle_simulation --features game`
+
 use corewarp::game::prelude::*;
 use corewarp::prelude::*;
 
 fn main() -> Result<()> {
     let mut device = Device::host()?;
-    // 2 partículas: px py pz vx vy vz
+    // Two particles packed AoS: px py pz vx vy vz
     let state = device.upload(&[
-        0.0, 10.0, 0.0, 1.0, 0.0, 0.0, //
-        0.0, 5.0, 0.0, -1.0, 2.0, 0.0,
+        0.0, 10.0, 0.0, 1.0, 0.0, 0.0, // particle 0
+        0.0, 5.0, 0.0, -1.0, 2.0, 0.0, // particle 1
     ])?;
 
     let sub = update_particles(

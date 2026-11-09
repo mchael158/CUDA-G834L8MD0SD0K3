@@ -1,3 +1,8 @@
+//! Host pipeline smoke test: SAXPY plus independent add/scale/reduction jobs.
+//!
+//! Exercises multi-slot issue on the host backend without requiring CUDA.
+//! Run with: `cargo run -p corewarp --release --example pipeline_sim`
+
 use corewarp::{BackendKind, CoreWarp, Operation, Priority, SchedulingPolicy};
 
 fn main() -> corewarp::Result<()> {
@@ -24,7 +29,7 @@ fn main() -> corewarp::Result<()> {
         },
     )?;
 
-    // Mais três ops independentes (vector add / scale / reduction).
+    // Three additional independent ops (vector add / scale / reduction).
     let a = rt.upload(&vec![1.0; 1024])?;
     let b = rt.upload(&vec![2.0; 1024])?;
     let out = rt.alloc_zeros(1024)?;
