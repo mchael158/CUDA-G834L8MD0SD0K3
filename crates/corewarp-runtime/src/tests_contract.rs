@@ -165,6 +165,32 @@ fn rejects_bad_shapes() {
     assert!(matches!(err, Error::Invalid(_)));
 }
 
+/// Aliased read/write buffers must be rejected (prevents CUDA resident orphaning).
+#[test]
+fn rejects_aliased_buffers() {
+    let mut rt = host_rt();
+    let x = rt.upload(&[1.0, 2.0]).unwrap();
+    let err = rt
+        .submit(Operation::Saxpy {
+            alpha: 1.0,
+            x,
+            y: x,
+        })
+        .unwrap_err();
+    assert!(matches!(err, Error::Invalid(_)));
+
+    let a = rt.upload(&[1.0, 2.0]).unwrap();
+    let b = rt.upload(&[3.0, 4.0]).unwrap();
+    let err = rt
+        .submit(Operation::VectorAdd {
+            a,
+            b,
+            output: a,
+        })
+        .unwrap_err();
+    assert!(matches!(err, Error::Invalid(_)));
+}
+
 /// `download` must internally poll until the buffer is no longer in-flight.
 #[test]
 fn download_waits_until_complete() {

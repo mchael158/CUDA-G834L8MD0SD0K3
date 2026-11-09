@@ -275,6 +275,11 @@ impl Operation {
                 if nx == 0 || nx != ny {
                     return Err(Error::Invalid("saxpy: incompatible x/y lengths"));
                 }
+                // Distinct buffers required: CUDA take_resident would orphan the first
+                // resident if x == y, leaving host_dirty cleared and the next job wrong.
+                if x == y {
+                    return Err(Error::Invalid("saxpy: x and y must be distinct buffers"));
+                }
             }
             Self::VectorAdd { a, b, output } => {
                 let na = len_of(a)?;
@@ -283,12 +288,24 @@ impl Operation {
                 if na == 0 || na != nb || na != no {
                     return Err(Error::Invalid("vector_add: incompatible lengths"));
                 }
+                // Pairwise-distinct operands: double take_resident on the same id
+                // drops the resident map entry and breaks later H2D coherence.
+                if a == b || a == output || b == output {
+                    return Err(Error::Invalid(
+                        "vector_add: a, b, and output must be distinct buffers",
+                    ));
+                }
             }
             Self::VectorScale { input, output, .. } | Self::Normalize { input, output, .. } => {
                 let ni = len_of(input)?;
                 let no = len_of(output)?;
                 if ni == 0 || ni != no {
                     return Err(Error::Invalid("scale/normalize: incompatible lengths"));
+                }
+                if input == output {
+                    return Err(Error::Invalid(
+                        "scale/normalize: input and output must be distinct buffers",
+                    ));
                 }
             }
             Self::ReductionSum { input, output } => {
@@ -299,6 +316,11 @@ impl Operation {
                 }
                 if no != 1 {
                     return Err(Error::Invalid("reduction: output length must be 1"));
+                }
+                if input == output {
+                    return Err(Error::Invalid(
+                        "reduction: input and output must be distinct buffers",
+                    ));
                 }
             }
             Self::ParticleUpdate { state, .. } => {
@@ -315,6 +337,11 @@ impl Operation {
                 if ni == 0 || ni != no {
                     return Err(Error::Invalid("prefix_sum: incompatible lengths"));
                 }
+                if input == output {
+                    return Err(Error::Invalid(
+                        "prefix_sum: input and output must be distinct buffers",
+                    ));
+                }
             }
             Self::Histogram {
                 input,
@@ -329,6 +356,11 @@ impl Operation {
                 }
                 if !(max_v > min_v) {
                     return Err(Error::Invalid("histogram: max_v must be greater than min_v"));
+                }
+                if input == output {
+                    return Err(Error::Invalid(
+                        "histogram: input and output must be distinct buffers",
+                    ));
                 }
             }
         }
