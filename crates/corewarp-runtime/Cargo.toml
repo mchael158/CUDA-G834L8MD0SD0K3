@@ -1,0 +1,18 @@
+[package]
+name = "corewarp-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Device, scheduling, backends host/CUDA"
+
+[features]
+default = ["host"]
+host = []
+cuda = ["dep:cudarc"]
+
+[dependencies]
+corewarp-core = { workspace = true }
+corewarp-telemetry = { workspace = true }
+corewarp-memory = { workspace = true }
+cudarc = { workspace = true, optional = true }

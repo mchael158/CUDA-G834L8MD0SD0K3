@@ -1,0 +1,61 @@
+[package]
+name = "corewarp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "GPU Compute Toolkit — facade"
+
+[features]
+default = ["host"]
+host = ["corewarp-runtime/host"]
+cuda = ["corewarp-runtime/cuda"]
+ai = ["dep:corewarp-ai"]
+game = ["dep:corewarp-game"]
+full = ["cuda", "ai", "game"]
+
+[dependencies]
+corewarp-core = { workspace = true }
+corewarp-telemetry = { workspace = true }
+corewarp-memory = { workspace = true }
+corewarp-runtime = { workspace = true }
+corewarp-kernels = { workspace = true }
+corewarp-ai = { workspace = true, optional = true }
+corewarp-game = { workspace = true, optional = true }
+
+[[example]]
+name = "pipeline_sim"
+path = "../../examples/pipeline_sim.rs"
+
+[[example]]
+name = "bench_host"
+path = "../../examples/bench_host.rs"
+
+[[example]]
+name = "saxpy_cuda"
+path = "../../examples/saxpy_cuda.rs"
+required-features = ["cuda"]
+
+[[example]]
+name = "bench_manual_vs_runtime"
+path = "../../examples/bench_manual_vs_runtime.rs"
+required-features = ["cuda"]
+
+[[example]]
+name = "bench_pool"
+path = "../../examples/bench_pool.rs"
+required-features = ["cuda"]
+
+[[example]]
+name = "image_processing"
+path = "../../examples/image-processing/main.rs"
+
+[[example]]
+name = "tensor_operations"
+path = "../../examples/tensor-operations/main.rs"
+required-features = ["ai"]
+
+[[example]]
+name = "particle_simulation"
+path = "../../examples/particle-simulation/main.rs"
+required-features = ["game"]

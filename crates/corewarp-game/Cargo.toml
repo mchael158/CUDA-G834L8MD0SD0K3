@@ -1,0 +1,11 @@
+[package]
+name = "corewarp-game"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Primitivas GPU para simulação e jogos"
+
+[dependencies]
+corewarp-core = { workspace = true }
+corewarp-runtime = { workspace = true }

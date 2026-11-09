@@ -1,0 +1,7 @@
+[package]
+name = "corewarp-telemetry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Métricas e telemetria do CoreWarp"

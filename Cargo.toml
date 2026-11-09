@@ -1,0 +1,34 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/corewarp-core",
+    "crates/corewarp-telemetry",
+    "crates/corewarp-memory",
+    "crates/corewarp-runtime",
+    "crates/corewarp-kernels",
+    "crates/corewarp-ai",
+    "crates/corewarp-game",
+    "crates/corewarp",
+]
+default-members = ["crates/corewarp"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+corewarp-core = { path = "crates/corewarp-core" }
+corewarp-telemetry = { path = "crates/corewarp-telemetry" }
+corewarp-memory = { path = "crates/corewarp-memory" }
+corewarp-runtime = { path = "crates/corewarp-runtime" }
+corewarp-kernels = { path = "crates/corewarp-kernels" }
+corewarp-ai = { path = "crates/corewarp-ai" }
+corewarp-game = { path = "crates/corewarp-game" }
+cudarc = { version = "0.19", default-features = false, features = [
+    "cuda-12060",
+    "driver",
+    "nvrtc",
+    "dynamic-loading",
+] }
