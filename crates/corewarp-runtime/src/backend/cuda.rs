@@ -396,9 +396,12 @@ impl CudaBackend {
             self.resident.insert(id.0, Resident { device, len });
         }
 
+        // Upload when needed, but do NOT clear `host_dirty` here. Clearing only after
+        // `try_issue` fully succeeds prevents a mid-issue failure (failed launch /
+        // orphaned take_resident) from leaving the host marked clean while the next
+        // job would skip H2D and read stale/wrong device memory.
         if host_dirty || missing {
             self.h2d_buffer(id, stream, memory, metrics, slot_idx)?;
-            memory.get_mut(id)?.host_dirty = false;
         }
         Ok(())
     }
@@ -818,6 +821,13 @@ impl Backend for CudaBackend {
             .new_event(Some(CUevent_flags::CU_EVENT_DISABLE_TIMING))
             .map_err(cu_err)?;
         done.record(&stream).map_err(cu_err)?;
+
+        // Issue succeeded: host mirrors that were uploaded are now reflected on device.
+        for id in &buffer_ids {
+            if let Ok(entry) = memory.get_mut(*id) {
+                entry.host_dirty = false;
+            }
+        }
 
         let slot = &mut self.slots[slot_idx];
         slot.busy = true;
