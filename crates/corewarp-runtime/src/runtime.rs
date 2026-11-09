@@ -375,7 +375,9 @@ impl CoreWarpBuilder {
         self
     }
 
-    /// If true, CUDA construction errors propagate instead of host fallback.
+    /// When selecting [`BackendKind::Cuda`], construction always requires a working
+    /// CUDA backend. This flag is retained for API compatibility; `false` no longer
+    /// enables a silent host fallback (that path hid GPU init failures from benches).
     pub fn require_cuda(mut self, yes: bool) -> Self {
         self.require_cuda = yes;
         self
@@ -384,7 +386,7 @@ impl CoreWarpBuilder {
     /// Validate config and construct the runtime + selected backend.
     pub fn build(self) -> Result<CoreWarp> {
         let cfg = self.cfg;
-        let require_cuda = self.require_cuda;
+        let _require_cuda = self.require_cuda;
         if cfg.stream_count == 0 || cfg.max_in_flight == 0 || cfg.issue_width == 0 {
             return Err(Error::Invalid("stream_count/max_in_flight/issue_width > 0"));
         }
@@ -394,21 +396,15 @@ impl CoreWarpBuilder {
             BackendKind::Cuda => {
                 #[cfg(feature = "cuda")]
                 {
-                    match CudaBackend::new(cfg.stream_count) {
-                        Ok(b) => BackendBox::Cuda(b),
-                        Err(e) if require_cuda => return Err(e),
-                        // Soft fallback only when require_cuda is false (legacy path).
-                        Err(_) => BackendBox::Host(HostBackend::new(cfg.stream_count)),
-                    }
+                    // Never silently fall back to Host: callers that asked for CUDA
+                    // must observe init/driver failures instead of CPU results.
+                    BackendBox::Cuda(CudaBackend::new(cfg.stream_count)?)
                 }
                 #[cfg(not(feature = "cuda"))]
                 {
-                    if require_cuda {
-                        return Err(Error::Backend(
-                            "feature `cuda` was not compiled into this binary".into(),
-                        ));
-                    }
-                    BackendBox::Host(HostBackend::new(cfg.stream_count))
+                    return Err(Error::Backend(
+                        "feature `cuda` was not compiled into this binary".into(),
+                    ));
                 }
             }
         };
