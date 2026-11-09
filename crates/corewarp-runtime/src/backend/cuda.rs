@@ -490,22 +490,36 @@ impl CudaBackend {
             }
         }
 
-        if let Some((out_id, pin, npartial)) = pending_reduce {
-            if let Ok(slice) = pin.as_slice() {
-                let sum: f32 = slice[..npartial].iter().copied().sum();
-                if let Ok(entry) = memory.get_mut(out_id) {
-                    entry.host[0] = sum;
-                    entry.host_dirty = true;
-                    entry.device_dirty = false;
+        // Only apply successful write-side effects when the job did not fail.
+        // Applying reduce/dirty updates after a CUDA error would mark buffers as
+        // coherent with wrong/partial data while the runtime reports Failed.
+        let mut failed = failed;
+        if failed.is_none() {
+            if let Some((out_id, pin, npartial)) = pending_reduce {
+                match pin.as_slice() {
+                    Ok(slice) => {
+                        let sum: f32 = slice[..npartial].iter().copied().sum();
+                        if let Ok(entry) = memory.get_mut(out_id) {
+                            entry.host[0] = sum;
+                            entry.host_dirty = true;
+                            entry.device_dirty = false;
+                        }
+                        // Device scalar stays stale until next ensure sees host_dirty.
+                    }
+                    Err(e) => {
+                        // Previously swallowed: job completed "ok" with stale zeros on host.
+                        failed = Some(format!("reduction pinned read failed: {e:?}"));
+                    }
                 }
-                // Device copy of scalar output stays stale until next `ensure_resident` sees `host_dirty`.
             }
-        }
 
-        for id in &written {
-            if let Ok(entry) = memory.get_mut(*id) {
-                if !entry.host_dirty {
-                    entry.device_dirty = true;
+            if failed.is_none() {
+                for id in &written {
+                    if let Ok(entry) = memory.get_mut(*id) {
+                        if !entry.host_dirty {
+                            entry.device_dirty = true;
+                        }
+                    }
                 }
             }
         }
